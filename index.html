@@ -118,7 +118,7 @@
   // A minor=0; sharp side +, flat side -. (Relative minor sits 3 flatward of its major.)
   // Am 0, Em +1, Bm +2, F#m +3, C#m +4, G#m +5, D#m +6
   // Dm -1, Gm -2, Cm -3, Fm -4, Bbm -5, Ebm -6
-  var COF = { 9:0, 4:1, 11:2, 6:3, 1:4, 8:5, 3:6, 2:-1, 7:-2, 0:-3, 5:-4, 10:-5 };
+  var COF = { 9:0, 4:1, 11:2, 6:3, 1:4, 8:5, 3:-6, 2:-1, 7:-2, 0:-3, 5:-4, 10:-5 };
   // returns the chromatic index's name spelled for the current key's sharp/flat preference
   function spell(idx) {
     var pos = COF[state.rootIndex];        // where the chosen KEY sits on the circle
@@ -178,17 +178,22 @@
   }
   load();
 
-  var ctx = null, master, delayNode, delayFb, delayWet, reverbNode, recTap, recDest;
+  var ctx = null, master, limiter, delayNode, delayFb, delayWet, reverbNode, recTap, recDest;
   function ac() { if (!ctx) { ctx = new (window.AudioContext || window.webkitAudioContext)(); buildGraph(); } if (ctx.state === "suspended") ctx.resume(); return ctx; }
   function buildGraph() {
     master = ctx.createGain(); master.gain.value = 0.85;
+    // brickwall-ish limiter on the master so distortion can be LOUD without clipping the output
+    limiter = ctx.createDynamicsCompressor();
+    limiter.threshold.value = -6; limiter.knee.value = 0; limiter.ratio.value = 20;
+    limiter.attack.value = 0.002; limiter.release.value = 0.12;
     recTap = ctx.createGain(); recTap.gain.value = 1;          // everything audible passes through here
     delayNode = ctx.createDelay(1.0); delayNode.delayTime.value = 0.3;
     delayFb = ctx.createGain(); delayFb.gain.value = 0.4;
     delayWet = ctx.createGain(); delayWet.gain.value = 0;
     delayNode.connect(delayFb); delayFb.connect(delayNode); delayNode.connect(delayWet);
-    master.connect(recTap);
-    master.connect(delayNode); delayWet.connect(recTap);
+    master.connect(limiter);
+    master.connect(delayNode); delayWet.connect(limiter);
+    limiter.connect(recTap);
     recTap.connect(ctx.destination);                           // to speakers
     recDest = ctx.createMediaStreamDestination();
     recTap.connect(recDest);                                   // to recorder
@@ -213,7 +218,12 @@
     osc(baseType, 1, 0).connect(sum);
     if (state.fx.chorus) { osc(baseType, 1, 8).connect(sum); osc(baseType, 1, -7).connect(sum); }
     if (state.distortion || sab) { osc("square", 1, 12).connect(sum); }
-    if (sab) { osc("sawtooth", 0.5, -5).connect(sum); }   // sabbath: always a sub for weight
+    if (sab) {
+      // thick low end + a detuned unison for a wall-of-amps feel; clips richer than a lone saw
+      var subG = a.createGain(); subG.gain.value = 0.8; var sub = osc("sawtooth", 0.5, -4); sub.connect(subG); subG.connect(sum);
+      osc("sawtooth", 1, -9).connect(sum);   // detuned unison
+      osc("square", 0.5, 6).connect(sum);     // sub bite
+    }
     if (state.fx.octave) { var ob = osc(baseType, 0.5, 0); var og = a.createGain(); og.gain.value = 0.7; ob.connect(og); og.connect(sum); }
     return { sum: sum, oscs: oscs };
   }
@@ -233,29 +243,37 @@
       chain.connect(ap); chain = ap; extras.plfo = plfo;
     }
 
-    // distortion shaper
+    // distortion shaper + cabinet voicing
     if (state.distortion || state.sabbath) {
       var sab = state.sabbath;
-      var pre = a.createGain(); pre.gain.value = sab ? 4.5 : 1.4;            // slam the input
-      var shaper = a.createWaveShaper(); shaper.curve = makeCurve(sab ? 1400 : 400); shaper.oversample = "4x";
-      var chain2 = pre; pre.connect(shaper); chain2 = shaper;
+      // pre-emphasis: bump mids before clipping (tube-screamer style) so it bites musically
+      var preEmph = a.createBiquadFilter(); preEmph.type = "peaking";
+      preEmph.frequency.value = sab ? 650 : 800; preEmph.Q.value = 0.9; preEmph.gain.value = sab ? 10 : 6;
+      var pre = a.createGain(); pre.gain.value = sab ? 9 : 3.2;             // slam the input hard
+      var shaper = a.createWaveShaper(); shaper.curve = makeCurve(sab ? 1600 : 500); shaper.oversample = "4x";
+      chain.connect(preEmph); preEmph.connect(pre); pre.connect(shaper);
+      var chain2 = shaper;
       if (sab) {
-        // second clipping stage = past the max, fully fuzzed out
-        var shaper2 = a.createWaveShaper(); shaper2.curve = makeCurve(1400); shaper2.oversample = "4x";
+        var shaper2 = a.createWaveShaper(); shaper2.curve = makeCurve(1600); shaper2.oversample = "4x";
         chain2.connect(shaper2); chain2 = shaper2;
       }
-      var bp = a.createBiquadFilter(); bp.type = "bandpass"; bp.frequency.value = sab ? 900 : 1400; bp.Q.value = sab ? 2.4 : 1.6;
-      var lp = a.createBiquadFilter(); lp.type = "lowpass"; lp.frequency.value = sab ? 2400 : 3400;  // dark, woolly top end
-      chain.connect(pre); chain2.connect(bp); bp.connect(lp); chain = lp;
+      // --- cabinet sim: what makes it sound like a speaker, not a buzzy synth ---
+      var hp = a.createBiquadFilter(); hp.type = "highpass"; hp.frequency.value = sab ? 80 : 90;   // tighten flubby lows
+      var thump = a.createBiquadFilter(); thump.type = "peaking"; thump.frequency.value = sab ? 110 : 130; thump.Q.value = 1.1; thump.gain.value = sab ? 7 : 4; // 4x12 low thump
+      var honk = a.createBiquadFilter(); honk.type = "peaking"; honk.frequency.value = sab ? 2100 : 2600; honk.Q.value = 1.4; honk.gain.value = sab ? 5 : 4;     // presence honk
+      var scoop = a.createBiquadFilter(); scoop.type = "peaking"; scoop.frequency.value = 450; scoop.Q.value = 0.8; scoop.gain.value = sab ? -4 : -2;             // slight mid scoop
+      var cabRolloff = a.createBiquadFilter(); cabRolloff.type = "lowpass"; cabRolloff.frequency.value = sab ? 3200 : 4200; cabRolloff.Q.value = 0.7;              // speaker can't reproduce fizz
+      chain2.connect(hp); hp.connect(thump); thump.connect(scoop); scoop.connect(honk); honk.connect(cabRolloff);
+      chain = cabRolloff;
     }
 
     var gain = a.createGain();
-    // tremolo (amplitude LFO) modulates this gain around its level
-    var peak = state.sabbath ? 0.1 : (state.distortion ? 0.13 : 0.34);
+    // distortion now LOUDER than clean; limiter on master catches the peaks
+    var peak = state.sabbath ? 0.55 : (state.distortion ? 0.62 : 0.34);
     chain.connect(gain);
     gain.gain.value = 0.0001;
     gain.gain.exponentialRampToValueAtTime(peak, t + 0.01);
-    if (state.distortion || state.sabbath) gain.gain.exponentialRampToValueAtTime(peak*0.8, t + 0.25);
+    if (state.distortion || state.sabbath) gain.gain.exponentialRampToValueAtTime(peak*0.82, t + 0.3);
 
     if (state.fx.tremolo) {
       var tlfo = a.createOscillator(); tlfo.frequency.value = 6; var tg = a.createGain(); tg.gain.value = peak * 0.5;
