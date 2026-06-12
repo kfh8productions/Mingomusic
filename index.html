@@ -297,12 +297,13 @@
     v.baseFreq = f;
   }
   // bend a voice to a fractional semitone offset (gliss continuous bend); fast time-constant
-  function bendVoice(id, semisFloat) {
+  function bendVoice(id, semisFloat, fast) {
     var v = voices[id]; if (!v) return;
     var t = ctx.currentTime, midi = 48 + state.rootIndex + semisFloat, f = 440 * Math.pow(2, (midi - 69) / 12);
+    var tc = fast ? 0.004 : 0.012;
     v.oscs.forEach(function (o) {
       o.node.frequency.cancelScheduledValues(t);
-      o.node.frequency.setTargetAtTime(f * o.mult, t, 0.012);
+      o.node.frequency.setTargetAtTime(f * o.mult, t, tc);
     });
     v.baseFreq = f;
     v.bendSemis = semisFloat;
@@ -446,6 +447,17 @@
   function glissMove(pid, x, y) {
     var vid = "p" + pid;
     if (!voices[vid]) return;
+    // if the finger is currently over a tonic pad, snap cleanly to that tonic as you pass over it
+    var over = padFromPoint(x, y);
+    if (over) {
+      var oidx = parseInt(over.dataset.idx, 10);
+      if (PADS[oidx] && PADS[oidx].tonic) {
+        bendVoice(vid, PADS[oidx].semis, true);          // clean fast landing on the tonic
+        if (voices[vid]) voices[vid].bendSemis = PADS[oidx].semis;
+        if (settleTimers[pid]) { clearTimeout(settleTimers[pid]); delete settleTimers[pid]; }
+        return;
+      }
+    }
     var semis = glissSemisAt(x, y);
     if (semis === null) return;
     bendVoice(vid, semis);
