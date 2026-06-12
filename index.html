@@ -47,6 +47,8 @@
   .fx.rec.on .recdot { animation: recpulse 1s infinite; }
   @keyframes recpulse { 0%,100% { opacity: 1; } 50% { opacity: 0.25; } }
   .fx.take.on { background: #07331f; border-color: #2ec26f; color: #6dffa8; box-shadow: 0 0 8px rgba(46,194,111,0.5); }
+  .fx.gliss { border-color: #3a2a5a; color: #a98fd8; }
+  .fx.gliss.on { background: #1a0f33; color: #c9a8ff; border-color: #9d6dff; box-shadow: 0 0 12px rgba(157,109,255,0.7); }
 
   .board { flex: 1; position: relative; touch-action: none; }
   .pad { position: absolute; border: none; border-radius: 14px; font-family: inherit; cursor: pointer; color: #0a0a0a; display: flex; align-items: center; justify-content: center; transition: transform 0.05s, filter 0.05s, box-shadow 0.05s; box-shadow: 0 4px 0 rgba(0,0,0,0.35), inset 0 2px 6px rgba(255,255,255,0.25); overflow: hidden; }
@@ -92,6 +94,7 @@
     <button class="fx take" id="playBtn" style="display:none">▶ Loop</button>
     <button class="fx take" id="dlBtn" style="display:none">⬇ Save</button>
     <button class="fx sabbath" id="sabbathBtn">☩ Sabbath</button>
+    <button class="fx gliss" id="glissBtn">↝ Gliss</button>
     <button class="fx" data-fx="delay">Delay</button>
     <button class="fx" data-fx="phaser">Phaser</button>
     <button class="fx" data-fx="octave">Octave</button>
@@ -160,7 +163,7 @@
   var ROWS = 8;
   var DEG_COLOUR = { "1": "#ff4d8d", "\u266d3": "#ff9f1c", "4": "#ffd23f", "5": "#6dd47e", "\u266d7": "#3ec6c9" };
 
-  var state = { rootIndex: 11, distortion: false, sabbath: false, fx: { delay:false, phaser:false, octave:false, chorus:false, tremolo:false }, presets: [] };
+  var state = { rootIndex: 11, distortion: false, sabbath: false, gliss: false, fx: { delay:false, phaser:false, octave:false, chorus:false, tremolo:false }, presets: [] };
   for (var i = 0; i < 20; i++) state.presets.push({ name: "", key: -1 });
 
   // ---- persistence ----
@@ -172,6 +175,7 @@
       if (typeof s.rootIndex === "number") state.rootIndex = s.rootIndex;
       if (typeof s.distortion === "boolean") state.distortion = s.distortion;
       if (typeof s.sabbath === "boolean") state.sabbath = s.sabbath;
+      if (typeof s.gliss === "boolean") state.gliss = s.gliss;
       if (s.fx) for (var k in state.fx) if (k in s.fx) state.fx[k] = s.fx[k];
       if (Array.isArray(s.presets)) for (var i = 0; i < 20 && i < s.presets.length; i++) if (s.presets[i]) state.presets[i] = s.presets[i];
     } catch (e) {}
@@ -292,6 +296,28 @@
     });
     v.baseFreq = f;
   }
+  // bend a voice to a fractional semitone offset (gliss continuous bend); fast time-constant
+  function bendVoice(id, semisFloat) {
+    var v = voices[id]; if (!v) return;
+    var t = ctx.currentTime, midi = 48 + state.rootIndex + semisFloat, f = 440 * Math.pow(2, (midi - 69) / 12);
+    v.oscs.forEach(function (o) {
+      o.node.frequency.cancelScheduledValues(t);
+      o.node.frequency.setTargetAtTime(f * o.mult, t, 0.012);
+    });
+    v.baseFreq = f;
+    v.bendSemis = semisFloat;
+  }
+  // snap a voice to the nearest whole semitone and lock cleanly
+  function quantiseVoice(id) {
+    var v = voices[id]; if (!v || typeof v.bendSemis !== "number") return;
+    var snapped = Math.round(v.bendSemis);
+    var t = ctx.currentTime, midi = 48 + state.rootIndex + snapped, f = 440 * Math.pow(2, (midi - 69) / 12);
+    v.oscs.forEach(function (o) {
+      o.node.frequency.cancelScheduledValues(t);
+      o.node.frequency.setTargetAtTime(f * o.mult, t, 0.02);
+    });
+    v.baseFreq = f; v.bendSemis = snapped;
+  }
   function stopVoice(id) {
     var v = voices[id]; if (!v) return;
     var t = ctx.currentTime;
@@ -387,18 +413,59 @@
   window.addEventListener("resize", layoutBoard);
 
   function padFromPoint(x, y) { var el = document.elementFromPoint(x, y); while (el && !el.classList.contains("pad")) el = el.parentElement; return el; }
+  // For gliss: interpolate a continuous semitone from finger position between the two nearest pad centres.
+  function glissSemisAt(x, y) {
+    var best = null, second = null;
+    PADS.forEach(function (p, idx) {
+      var el = padEls[idx]; if (!el) return;
+      var r = el.getBoundingClientRect();
+      var cx = r.left + r.width / 2, cy = r.top + r.height / 2;
+      var d = Math.hypot(x - cx, y - cy);
+      var rec = { idx: idx, d: d, cx: cx, cy: cy, semis: PADS[idx].semis };
+      if (!best || d < best.d) { second = best; best = rec; }
+      else if (!second || d < second.d) { second = rec; }
+    });
+    if (!best) return null;
+    if (!second) return best.semis;
+    // project finger onto the line between the two nearest centres -> t in [0,1]
+    var vx = second.cx - best.cx, vy = second.cy - best.cy;
+    var len2 = vx*vx + vy*vy;
+    var tproj = len2 ? Math.max(0, Math.min(1, ((x - best.cx)*vx + (y - best.cy)*vy) / len2)) : 0;
+    return best.semis + (second.semis - best.semis) * tproj;
+  }
+
   var pointerPad = {};
+  var settleTimers = {};
   function press(pid, padEl) {
     var idx = parseInt(padEl.dataset.idx, 10), vid="p"+pid, prev=pointerPad[pid];
     if (prev && prev!==padEl) prev.classList.remove("down");
     pointerPad[pid]=padEl; padEl.classList.add("down");
     if (voices[vid]) glideVoice(vid, PADS[idx].semis); else startVoice(vid, PADS[idx].semis);
-    if (voices[vid]) voices[vid].padIdx = idx;
+    if (voices[vid]) { voices[vid].padIdx = idx; voices[vid].bendSemis = PADS[idx].semis; }
   }
-  function lift(pid) { var vid="p"+pid; stopVoice(vid); if (pointerPad[pid]) pointerPad[pid].classList.remove("down"); delete pointerPad[pid]; }
+  function glissMove(pid, x, y) {
+    var vid = "p" + pid;
+    if (!voices[vid]) return;
+    var semis = glissSemisAt(x, y);
+    if (semis === null) return;
+    bendVoice(vid, semis);
+    // reset settle timer; when finger holds still briefly, snap to nearest semitone
+    if (settleTimers[pid]) clearTimeout(settleTimers[pid]);
+    settleTimers[pid] = setTimeout(function () { quantiseVoice(vid); }, 80);
+  }
+  function lift(pid) {
+    var vid="p"+pid; stopVoice(vid);
+    if (pointerPad[pid]) pointerPad[pid].classList.remove("down");
+    delete pointerPad[pid];
+    if (settleTimers[pid]) { clearTimeout(settleTimers[pid]); delete settleTimers[pid]; }
+  }
   var board = document.getElementById("board");
-  board.addEventListener("pointerdown", function (e) { var pad=padFromPoint(e.clientX,e.clientY); if (pad){e.preventDefault();ac();press(e.pointerId,pad);} });
-  board.addEventListener("pointermove", function (e) { if (!(e.pointerId in pointerPad)) return; var pad=padFromPoint(e.clientX,e.clientY); if (pad && pad!==pointerPad[e.pointerId]) press(e.pointerId,pad); });
+  board.addEventListener("pointerdown", function (e) { var pad=padFromPoint(e.clientX,e.clientY); if (pad){e.preventDefault();ac();press(e.pointerId,pad); if (state.gliss) glissMove(e.pointerId, e.clientX, e.clientY);} });
+  board.addEventListener("pointermove", function (e) {
+    if (!(e.pointerId in pointerPad)) return;
+    if (state.gliss) { e.preventDefault(); glissMove(e.pointerId, e.clientX, e.clientY); return; }
+    var pad=padFromPoint(e.clientX,e.clientY); if (pad && pad!==pointerPad[e.pointerId]) press(e.pointerId,pad);
+  });
   function endPtr(e) { if (e.pointerId in pointerPad) lift(e.pointerId); }
   board.addEventListener("pointerup", endPtr); board.addEventListener("pointercancel", endPtr); board.addEventListener("pointerleave", endPtr);
 
@@ -452,6 +519,15 @@
     state.sabbath = !state.sabbath;
     sabbathBtn.classList.toggle("on", state.sabbath);
     ac(); save();
+  });
+
+  var glissBtn = document.getElementById("glissBtn");
+  if (state.gliss) glissBtn.classList.add("on");
+  glissBtn.addEventListener("pointerdown", function (e) {
+    e.preventDefault(); e.stopPropagation();
+    state.gliss = !state.gliss;
+    glissBtn.classList.toggle("on", state.gliss);
+    save();
   });
 
   // ---- recording ----
